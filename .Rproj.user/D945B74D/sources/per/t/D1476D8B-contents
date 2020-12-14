@@ -1,0 +1,722 @@
+---
+title: "Differential Expression"
+author: "`r getOption('author')`"
+date: "`r Sys.Date()`"
+params:
+    bcb_file: "../data/se_genes_2020-03-03.rds"
+    output_dir: "."
+    design: !r formula(~ condition)
+    condition: "condition"
+    sig_genes_alpha: 0.05
+    lfc: 1
+    outputDir: "."
+output:
+  html_document:
+    code_folding: "hide"
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    collapsed: true
+---
+
+```{r check-library-functions, echo=FALSE, message=FALSE}
+check_install = function(packages) {
+    not_installed = setdiff(packages, rownames(installed.packages()))
+    if (length(not_installed) > 0) {
+        write(paste("The libraries", not_installed, "are not installed, aborting.",
+                    sep = " "), stderr())
+        stop()
+    }
+}
+```
+
+```{r load-libraries, echo=FALSE, message=FALSE, warning=FALSE}
+packages = c("ggplot2","pheatmap", "scales", "SummarizedExperiment",
+             "DESeq2", "tximport", "DT", "DEGreport", "dplyr", "rio", "tibble", "AnnotationHub","hbcABC", "CHBUtils")
+check_install(packages)
+installed = lapply(packages, library, character.only = TRUE)
+source("_helperFunctions.R")
+```
+
+```{r prepare Functions}
+set.seed(1234567890)
+pca_loadings = function(object, ntop=nrow(as.matrix(object))) {
+    rv <- matrixStats::rowVars(as.matrix(object))
+    select <- order(rv, decreasing = TRUE)[seq_len(min(ntop,
+                                                       length(rv)))]
+    pca <- prcomp(t(as.matrix(object)[select, ]))
+    percentVar <- pca$sdev^2/sum(pca$sdev^2)
+    names(percentVar) = colnames(pca$x)
+    pca$percentVar = percentVar
+    return(pca)}
+
+'%!in%' <- function(x,y)!('%in%'(x,y))
+```
+
+
+```{r header, child="_header.Rmd", eval=file.exists("_header.Rmd")}
+```
+
+```{r message=FALSE ,warning = FALSE}
+if (file.exists("_setup.R")) {
+    source("_setup.R")
+}
+```
+
+# Load data
+
+The rds data from QC step was loaded for DGE analysis.
+
+```{r}
+# Directory paths
+dataDir <- file.path(params$outputDir, "data",Sys.Date())
+resultsDir <- file.path(params$outputDir, "results",Sys.Date())
+
+countsDir <- file.path(dataDir,"counts")
+deDir <- file.path(resultsDir, "differential_expression")
+invisible(mapply(
+    FUN = dir.create,
+    list(dataDir, resultsDir, countsDir, deDir),
+    MoreArgs = list(recursive = TRUE, showWarnings = FALSE)
+))
+```
+
+```{r}
+bcb <- readRDS(params$bcb_file)
+metrics_bcb <- bcb@metadata$metrics %>% tibble::remove_rownames() %>%  tibble::column_to_rownames(var = "sample")  # generate rownames from "sample" column
+metadata_bcb <- colData(bcb) %>% as("data.frame")  # retrieve metadata, rownames are already "sample" information
+summarydata_bcb <- merge(metrics_bcb, metadata_bcb, by='row.names', all=TRUE) %>% 
+  column_to_rownames(var = "Row.names")  # IMPORTANT. Need to merge based on row names, bc the order of two tables are not the same
+```
+
+```{r}
+counts_bcb <- assays(bcb)[["raw"]]  # retrieve raw counts
+counts_bcb <- counts_bcb[rowSums(counts_bcb) > 0,]  # remove genes that show 0 expression in all samples
+tpm_bcb <- assays(bcb)[["tpm"]]  # retrieve tpm counts
+counts_bcb <- counts_bcb[,rownames(summarydata_bcb)]  # just to make sure that samples are present in count matrix
+```
+
+```{r}
+# Building ensemble ID. Optional. Not run here.
+ah <- AnnotationHub()
+ahDb <- query(ah, pattern = c("Caenorhabditis Elegans","EnsDb") )
+
+id <- ahDb %>%
+     mcols() %>%
+       rownames() %>%
+        tail(n = 1)  # select the latest Ensembl version
+
+## Download the appropriate Ensembldb database.
+ahEnsdb <- ahDb[[id]]
+
+gene_ann <- genes(ahEnsdb)  %>%
+    as.data.frame() %>%
+    dplyr::select(c(gene_id,gene_name, description))
+
+## Read in transcript-wormbaseID txt file, bc transcript is the merging condition for the final result
+tx_wb <- read.csv("/Users/jil655/o2/PIs/william_mair/hbc_rnaseq_chipseq_Set2_and_CRTC1_aging_mutants_celegans_hbc03859/Mair_Project_in_R/data/c_elegans.canonical_bioproject.current.geneIDs.txt", header = FALSE)
+
+tx_wb <- tx_wb %>% 
+  dplyr::select(V2, V4)
+
+gene_ann <- left_join(gene_ann, tx_wb, by = c("gene_id" = "V2")) %>% 
+  dplyr::rename(seq_name = V4)  # merge wormbase ID and transcript ID (seq_name)
+
+```
+
+# DESeq analysis
+
+Generate dds data using the count matrix. Then perform DESeq and VST (variance stabilizing transformation).
+
+```{r}
+if (file.exists(file.path(dataDir,paste0("dds-",Sys.Date(),".rds")))) {
+    dds <- readRDS(file.path(dataDir,paste0("dds-",Sys.Date(),".rds")))
+} else {
+dds = DESeqDataSetFromMatrix(countData = counts_bcb, colData = summarydata_bcb, design = params$design)
+dds = DESeq(dds)  # Run Wald test with DESeq2
+saveRDS(dds,file = file.path(dataDir,paste0("dds-",Sys.Date(),".rds")))
+}  # generate dds object, and then run DESeq, finally save the rds object.
+```
+
+```{r}
+vst_dds = DESeq2::varianceStabilizingTransformation(dds)  # run vst transformation
+vstMat <- assay(vst_dds)
+```
+
+# Data structure
+
+We explored the structure of the data. As described in the QC, we observed that set2-crtc1 samples and set2 samples separate very well. WT samples and crtc1 samples are somewhat clustered close to each other. Different biological replicates show some variability within a same experimental condition, but the variance is not of a big concern.
+
+```{r }
+colorby = "condition"
+pc = pca_loadings(vstMat)
+comps = data.frame(pc$x)
+comps$fname = rownames(comps)  # add sample names
+comps <- left_join(comps,summarydata_bcb %>% as.data.frame() %>% tibble::rownames_to_column(var = "fname"),by = "fname")  # combine principal components and summarydata table 
+ggplot(comps, aes_string("PC1", "PC2")) +
+  geom_point(aes_string("PC1", "PC2",color=colorby,shape=NULL),size= 3) + theme_bw() +
+  xlab(paste0("PC1", ": ", round(pc$percentVar[1] * 100), "% variance")) +
+  ylab(paste0("PC2", ": ", round(pc$percentVar[2] * 100), "% variance"))+
+  theme(legend.text=element_text(size=12))+theme(legend.title=element_blank())
+```
+
+```{r}
+counts_bcb_norm <- counts(dds,normalized = T) %>% as.data.frame() %>% round() %>%
+    tibble::rownames_to_column(var = "id")
+```
+
+# Results
+
+We obtain the differential expression genes for the contrasts set2-crtc1 vs set2. We used set2 group as the base level, and studied the gene expression in set2-crtc1 group. We could potentially perform the analysis in a reverse way, or compare other experimental groups.
+
+```{r}
+#resultsNames(dds)
+all_results <- list()
+contrast1 = c("condition", "set2-crtc1","set2")  # base level: set2; experimental: set2-crtc1
+contrast2 = c("condition", "set2", "WT")
+contrast3 = c("condition", "set2-crtc1", "WT")
+contrast4 = c("condition", "crtc1", "WT")
+contrast5 = c("condition", "set2", "crtc1")
+contrast6 = c("condition", "set2-crtc1", "crtc1")
+
+res_unshrunken <- results(
+            dds,
+            contrast = contrast6)  #### Update contrast. Results without shrunken. Replace contrast to corresponding comparison
+
+res_shrunken <- lfcShrink(
+            dds = dds,
+            contrast = contrast6,
+            res = res_unshrunken)  #### Update contrast. Use default "normal" method for lfcShrink. But note that "apeglm" might show less bias
+
+res <- res_shrunken
+
+# Sort the results in the order of p-adjusted value        
+res <- res[order(res$padj),]
+res_unshrunken <- res_unshrunken[order(res_unshrunken$padj),]
+res_shrunken <- res_shrunken[order(res_shrunken$padj),]
+res_list = list("res_unshrunken" = res_unshrunken, "res_shrunken" = res_shrunken, "res" = res)
+all_results[[length(all_results) + 1]] <- res_list
+names(all_results) = "crtc1 vs set2-crtc1" #### Update contrast name
+```
+
+## Plots
+
+### Mean average (MA){.tabset}
+
+MA-plots are a great way to visualize the comparative expression metrics for a two group comparison. The x–axis is the average/mean expression over all the samples and the y-axis is the log2 fold change between the two conditions. The colored dots represent the genes that are differentially expressed (adjusted pvalue < `r params$sig_genes_alpha`). Upregulated genes are purple and downregulated, yellow.
+
+Two plots are presented, Shrunken and Unshrunken. In the former, the log2FC have been corrected (shrunken) to avoid big log2FC due to low counts. 
+
+```{r plot_ma, results = "asis", fig.height=10, fig.width=15}
+for (i in seq(length(all_results))) {
+  cat("\n####",names(all_results[i]),"{.tabset} \n")
+  cat("\n##### Shrunken\n")
+    res = all_results[[i]]$res_shrunken  # assign res to shrunken data
+    P <- plot_niceMA(res,alpha = params$sig_genes_alpha)  # use plot_niceMA function for MA plot. Sig gene alpha is set as default 0.05
+    print(P)
+    cat("\n")
+  cat("\n##### Unshrunken\n")
+    res = all_results[[i]]$res_unshrunken
+    P <- plot_niceMA(res,alpha = params$sig_genes_alpha)
+    print(P)
+    
+  cat("\n")
+}
+```
+
+### Volcano plot {.tabset}
+
+Volcano plots allow us to visualize differential expression along to statistical significance. In the x-axis the log2 fold change between the two groups is represented. In the y-axis, the adjusted (for multiple testing) p-value for the test of Differential Expression. The green shade area surrounds genes with adj pval <`r params$sig_genes_alpha` and |logFC|> `r params$lfc`. 
+
+```{r plot_volcano, results="asis"}
+for (i in seq(length(all_results))) {
+  cat("\n####",names(all_results[i]),"\n")
+  res = all_results[[i]]$res
+  stats = res %>% as.data.frame() %>% 
+      dplyr::select(c(log2FoldChange,padj))
+  p = volcano_density_plot(stats,  lfc.cutoff = params$lfc,pval.cutoff = params$sig_genes_alpha, title = names(all_results[i]))  # use the predefined function from CHBUtils
+  print(p)
+  cat("\n")
+}
+```
+
+### LRT results with degReport {.tabset}
+
+We take the expression values (VST transformed counts) for our siginficant genes in group1 and group2, and see if they cluster based on expression pattern. To do this we will use the R Bioconductor package DEGreport. The expression is as expected, in match with our definition of genes in group1 and group2.
+
+```{r degPatternPlot, results="asis", message=FALSE}
+# Re-level the factor in metadata, in preferred order
+metadata_bcb$condition <- factor(metadata_bcb$condition, levels = c("WT", "set2", "set2-crtc1", "crtc1"))
+# Obtain gene list for group1
+group1 <- read.table("data/group1.tsv", sep = "\t", header = T, quote = "")
+group1$seq_name_id <- as.character(group1$seq_name)  # create a new column for wormbase ID
+group1$seq_name_id <- sub("\\.","_",group1$seq_name)  # replace "." with "_"
+group1_genes <- as.character(group1$seq_name_id)
+any(is.na(group1_genes))
+
+# Obtain vst values for group1 genes
+cluster_vst_group1 <- vstMat[group1_genes, ]
+# Use the `degPatterns` function from the 'DEGreport' package to show gene clusters across sample groups
+clusters_group1 <- degPatterns(cluster_vst_group1, metadata = metadata_bcb, time = "condition", reduce=TRUE) # pdf export setting: 8 x 10
+
+# Get gene names for each cluster, among group1 genes
+cAssign <- clusters_group1$df
+cAssign$genes <- sub("\\_",".",cAssign$genes)  # reverse "_" back to "."
+
+# Get cluster genes (merge with other gene information from group1 df)
+cluster1 <- cAssign[which(cAssign$cluster == "1"), ] %>% 
+  left_join(group1, by=c("genes"="seq_name")) %>% 
+  select(c(2,1,3,4,5)) # select only first few columns
+
+cluster2 <- cAssign[which(cAssign$cluster == "2"), ] %>% 
+  left_join(group1, by=c("genes"="seq_name")) %>% 
+  select(c(2,1,3,4,5)) # select only first few columns
+
+cluster3 <- cAssign[which(cAssign$cluster == "3"), ] %>% 
+  left_join(group1, by=c("genes"="seq_name")) %>% 
+  select(c(2,1,3,4,5)) # select only first few columns
+
+cluster_summary <- dplyr::bind_rows(cluster1, cluster2, cluster3) # combine all the information in one file
+
+# Write clusters to file
+write.table(cluster_summary, file="results/Final/group1_degPattern_gene_info.txt", sep="\t",  row.names = F, quote=FALSE)
+
+# Obtain gene list for group2
+group2 <- read.table("data/group2.tsv", sep = "\t", header = T, quote = "")
+group2$seq_name_id <- as.character(group2$seq_name)  # create a new column for wormbase ID
+group2$seq_name_id <- sub("\\.","_",group2$seq_name)  # replace "." with "_"
+group2_genes <- as.character(group2$seq_name_id)
+any(is.na(group2_genes))
+
+# Obtain vst values for group2 genes
+cluster_vst_group2 <- vstMat[group2_genes, ]
+# Use the `degPatterns` function from the 'DEGreport' package to show gene clusters across sample groups
+clusters_group2 <- degPatterns(cluster_vst_group2, metadata = metadata_bcb, time = "condition", reduce=TRUE)
+```
+
+We also examined the DEG pattern for group 3 and group 4 genes. For group 3, we observed set2-crtc condition showing lower expression compared to set2 (but still higher than WT). This matches the fact that 1532 genes from group 3 have lower expression in set2-crtc, while 207 genes have higher expression. For group 4, we observed set2-crtc condition showing higher expression compared to set2 (but still lower than WT). It looks like crtc always has some effect when introduced.
+```{r}
+# Obtain gene list for group3
+group3 <- read.table("data/group3.tsv", sep = "\t", header = T, quote = "")
+group3$seq_name_id <- as.character(group3$seq_name)  # create a new column for wormbase ID
+group3$seq_name_id <- sub("\\.","_",group3$seq_name)  # replace "." with "_"
+group3_genes <- as.character(group3$seq_name_id)
+any(is.na(group3_genes))
+
+# Obtain vst values for group3 genes
+cluster_vst_group3 <- vstMat[group3_genes, ]
+# Use the `degPatterns` function from the 'DEGreport' package to show gene clusters across sample groups
+clusters_group3 <- degPatterns(cluster_vst_group3, metadata = metadata_bcb, time = "condition", reduce=TRUE)
+
+# Get gene names for each cluster, among group3 genes
+cAssign <- clusters_group3$df
+cAssign$genes <- sub("\\_",".",cAssign$genes)  # reverse "_" back to "."
+
+# Get cluster genes (merge with other gene information from group3 df)
+cluster1 <- cAssign[which(cAssign$cluster == "1"), ] %>% 
+  left_join(group3, by=c("genes"="seq_name")) %>% 
+  select(c(2,1,3,4,5)) # select only first few columns
+
+cluster2 <- cAssign[which(cAssign$cluster == "2"), ] %>% 
+  left_join(group3, by=c("genes"="seq_name")) %>% 
+  select(c(2,1,3,4,5)) # select only first few columns
+
+cluster_summary <- dplyr::bind_rows(cluster1, cluster2) # combine all the information in one file
+
+# Write clusters to file
+write.table(cluster_summary, file="results/Final/group3_degPattern_gene_info.txt", sep="\t",  row.names = F, quote=FALSE)
+
+# Obtain gene list for group4
+group4 <- read.table("data/group4.tsv", sep = "\t", header = T, quote = "")
+group4$seq_name_id <- as.character(group4$seq_name)  # create a new column for wormbase ID
+group4$seq_name_id <- sub("\\.","_",group4$seq_name)  # replace "." with "_"
+group4_genes <- as.character(group4$seq_name_id)
+any(is.na(group4_genes))
+
+# Obtain vst values for group4 genes
+cluster_vst_group4 <- vstMat[group4_genes, ]
+# Use the `degPatterns` function from the 'DEGreport' package to show gene clusters across sample groups
+clusters_group4 <- degPatterns(cluster_vst_group4, metadata = metadata_bcb, time = "condition", reduce=TRUE)
+
+# Get gene names for each cluster, among group4 genes
+cAssign <- clusters_group4$df
+cAssign$genes <- sub("\\_",".",cAssign$genes)  # reverse "_" back to "."
+
+# Get cluster genes (merge with other gene information from group4 df)
+cluster1 <- cAssign[which(cAssign$cluster == "1"), ] %>% 
+  left_join(group4, by=c("genes"="seq_name")) %>% 
+  select(c(2,1,3,4,5)) # select only first few columns
+
+cluster3 <- cAssign[which(cAssign$cluster == "3"), ] %>% 
+  left_join(group4, by=c("genes"="seq_name")) %>% 
+  select(c(2,1,3,4,5)) # select only first few columns
+
+cluster_summary <- dplyr::bind_rows(cluster1, cluster3) # combine all the information in one file
+
+# Write clusters to file
+write.table(cluster_summary, file="results/Final/group4_degPattern_gene_info.txt", sep="\t",  row.names = F, quote=FALSE)
+```
+
+After we updated the stringency for group 3 and group 4, we examined DEG pattern again.
+```{r}
+# Obtain gene list for group3
+group3 <- read.table("data/group3_stringent.tsv", sep = "\t", header = T, quote = "")
+group3$seq_name_id <- as.character(group3$seq_name)  # create a new column for wormbase ID
+group3$seq_name_id <- sub("\\.","_",group3$seq_name)  # replace "." with "_"
+group3_genes <- as.character(group3$seq_name_id)
+any(is.na(group3_genes))
+
+# Obtain vst values for group3 genes
+cluster_vst_group3 <- vstMat[group3_genes, ]
+# Use the `degPatterns` function from the 'DEGreport' package to show gene clusters across sample groups
+clusters_group3 <- degPatterns(cluster_vst_group3, metadata = metadata_bcb, time = "condition", reduce=TRUE)
+
+# Obtain gene list for group4
+group4 <- read.table("data/group4_stringent.tsv", sep = "\t", header = T, quote = "")
+group4$seq_name_id <- as.character(group4$seq_name)  # create a new column for wormbase ID
+group4$seq_name_id <- sub("\\.","_",group4$seq_name)  # replace "." with "_"
+group4_genes <- as.character(group4$seq_name_id)
+any(is.na(group4_genes))
+
+# Obtain vst values for group4 genes
+cluster_vst_group4 <- vstMat[group4_genes, ]
+# Use the `degPatterns` function from the 'DEGreport' package to show gene clusters across sample groups
+clusters_group4 <- degPatterns(cluster_vst_group4, metadata = metadata_bcb, time = "condition", reduce=TRUE)
+```
+
+### Top significant gene expression {.tabset}
+
+In order to check the differential expression results, we plot the counts for the top 12 significant genes, as ranked by lowest adjusted p-value. 
+
+We can observe differences in the expression of genes for set2-crtc1 group vs set2 group. In all cases, the gene expression in WT group and crtc1 group also resembles that of set2-crtc1 group. The result aligns with our previous phenotypic observation about life span of these groups.
+
+```{r differentialPlot-topGenes, results="asis", message=FALSE}
+rowData(dds)$ensgene <- rownames(dds)
+
+for (i in seq(length(all_results))) {
+  cat("\n####",names(all_results[i]),"\n")
+  p = degPlot(dds,all_results[[i]]$res,n = min(sum(all_results[[i]]$res$padj <= params$sig_genes_alpha,na.rm = T),12),xs = "condition",group = "condition")  # degPlot is a function in DEGreport. Find the total number of genes with padj lower than sig_genes_alpha (0.05). If the number is higher than 12, use 12. Pick top n genes for plot
+  p <- p + ggtitle(names(all_results[i])) + ylab("counts (log2)")
+  print(p)
+  cat("\n")
+}
+```
+
+## Results table
+
+```{r DESeq-tables, results='asis',echo=FALSE}
+sig_genes_list = vector(mode = "list", length =
+                            length(all_results))
+#sig_genes_list_names = vector(mode = "list", length = length(all_results))
+for (i in seq(length(all_results))) {
+  out_df = as.data.frame(all_results[[i]]$res)
+  out_df$id = rownames(out_df)
+  out_df = out_df[, c("id", colnames(out_df)[colnames(out_df) != "id"])]
+  
+  out_df <- out_df %>% 
+  inner_join(counts_bcb_norm,by = "id") %>% dplyr::select(-c(baseMean,lfcSE))  # adding expression count for each sample
+
+#### Below adding another column with gene name reversed from "_" to ".", and adding wormbase ID and gene name ####
+  out_df$wb_id <- as.character(out_df$id)  # create a new column for wormbase ID
+  out_df$wb_id <- sub("\\_",".",out_df$wb_id)  # replace "_" with "."
+  out_df = out_df[, c("wb_id", colnames(out_df)[colnames(out_df) != "wb_id"])]  # put wb_id column to the front
+  #tx2gene <- read.csv("/Users/jil655/o2/PIs/william_mair/hbc_rnaseq_chipseq_Set2_and_CRTC1_aging_mutants_celegans_hbc03859/mair_rnaseq/final/2020-02-22_mair_rnaseq/tx2gene.csv", header = FALSE)  # read in tx2gene file.eed to change the directory to make it work in other folders.
+  out_df <- left_join(out_df, gene_ann, by = c("wb_id" = "seq_name"))
+  #temp2 <- left_join(temp, gene_ann, by = c("V2" = "gene_id")) %>% 
+  #  rename(WBGeneID = V2)
+  out_df <- out_df[,c(1, 23, 24, 25, c(3:22))] %>% 
+    rename(seq_name = wb_id) # reorder the columns, and remove the id with "_"
+
+  rio::export(out_df, file = file.path(deDir,paste0(names(all_results)[i], ".tsv")))
+  sig_genes = subset(out_df, padj <= params$sig_genes_alpha)
+  sig_genes_list[[i]] = sig_genes
+  #sig_genes_list_names[[i]] = sig_genes$id
+  names(sig_genes_list)[i] = paste(names(all_results)[i])
+  #names(sig_genes_list_names)[i] = paste(names(all_results)[i])
+  rio::export(sig_genes[order(sig_genes$padj),], file = file.path(deDir,paste0(names(all_results)[i],"_",params$sig_genes_alpha,"_sigGenes.tsv")))
+}
+```
+
+In the result folder, two files are generated. The first one contains results for all the genes, and the second one contains only results for the significant ones (adjusted pval <`r params$sig_genes_alpha`).
+
+Each file has 5 columns (+ 16 samples) separated by tabs.
+
+* id: Gene name.
+* log2FoldChange: Effect size estimate in the form of log2 fold change. For the form set2-crtc1 vs set2, it represents the log2 of the ratio [expression in set2-crtc1]/[expression in set2]. A positive value indicates that the gene is upregulated in set2-crtc1 compared to set2. A negative one, downregulated.
+* pvalue: Wald test p-value.
+* padj: BH adjusted p-values.
+* Normalized rounded counts for each sample (16 columns).
+* You can ignore the 3rd column stat
+
+The differential expression results tables along with the count data (normalizedCounts and rawCounts) can be found in the results folder.
+
+```{r}
+rio::export(as.data.frame(counts_bcb_norm),file = file.path(countsDir,"norm_counts.csv.gz"))
+rio::export(tibble::rownames_to_column(as.data.frame(counts_bcb), var = "ID"),file = file.path(countsDir,"raw_counts.csv.gz"))
+```
+ 
+# Significant genes
+
+## Heatmap
+
+### Heatmap with significant genes{.tabset}
+
+This plot shows only differentially expressed genes on a per-sample basis. We have scaled the data by row.
+
+We generate heatmaps for the different comparisons using the expression values of significant genes. Each row represents the normalized expression of a significant gene and each column, a sample. This plot helps to identify patterns of expression of genes between samples in the form of clusters. Expression of genes is centered and scaled by row to highlight differences in each gene sample. 
+
+We can see that set2 samples are clustered together, while the other three groups are clustered together. The result further confirms that gene expression profile in set2 group is different than that of other groups.
+
+```{r DE-Heatmaps, results = "asis"}
+tmp_metadata <- summarydata_bcb %>% as.data.frame() %>%  dplyr::select(c("condition"))
+vstMat <- assay(vst_dds)
+for (i in seq(length(all_results))) {
+  cat("\n####",names(all_results[i]),"\n")
+  counts_SigGenes = vstMat[sig_genes_list[[i]]$id,]
+  if (length(counts_SigGenes) < 1){
+    next
+  }
+  pheatmap::pheatmap(counts_SigGenes, scale = "row", show_rownames = F, show_colnames = F, annotation_col = tmp_metadata, main = names(all_results[i]),
+                     fontsize_row = 6)
+  cat("\n")
+}
+```
+
+## PCA 
+
+### PCA with significant genes{.tabset}
+
+Finally, we performed PCA again using the information from only the significant genes. We observed that the significant genes can clearly separate samples based on different experimental condition.
+
+```{r pca , results="asis"}
+colorby = "condition"
+for (i in seq(length(all_results))) {
+  cat("\n####",names(all_results[i]),"\n")
+  counts_SigGenes = vstMat[sig_genes_list[[i]]$id,]
+  pc = pca_loadings(counts_SigGenes)
+  comps = data.frame(pc$x)
+  comps$fname = rownames(comps)
+  comps <- left_join(comps,summarydata_bcb %>% as.data.frame() %>% tibble::rownames_to_column(var = "fname"),by = "fname")
+  p <- ggplot(comps, aes_string("PC1", "PC2")) +
+    geom_point(aes_string("PC1", "PC2",color=colorby,shape=NULL),size= 3) + theme_bw() +
+    xlab(paste0("PC1", ": ", round(pc$percentVar[1] * 100), "% variance")) +
+    ylab(paste0("PC2", ": ", round(pc$percentVar[2] * 100), "% variance"))+
+    theme(legend.text=element_text(size=12))+theme(legend.title=element_blank()) +
+    ggtitle(names(all_results[i]))
+  print(p)
+  cat("\n")
+}
+```
+
+## Merge gene list
+Merge the significant gene list from two pairs of comparison: WT vs set2, and set2 vs set2-crtc1. Find the genes that show desired pattern.
+
+Group1: Genes that are upregulated in set2 compared to WT, and then reversed back in set2-crtc1 group
+
+Group2: Genes that are downregulated in set2 compared to WT, and then reversed back in set2-crtc1 group
+
+Group3: Genes that are upregulated in set2 compared to WT, but does not reverse back in set2-crtc1 group (not affected by crtc1)
+
+Group4: Genes that are downregulated in set2 compared to WT, but does not reverse back in set2-crtc1 group (not affected by crtc1)
+
+```{r}
+# Import significant gene list. Name WT vs set2 as comparison1, and set2 vs set2-crtc1 as comparison2.
+comparison1 <- read.table(file = "/Users/jil655/o2/PIs/william_mair/hbc_rnaseq_chipseq_Set2_and_CRTC1_aging_mutants_celegans_hbc03859/Mair_Project_in_R/DGE/results/2020-03-30/differential_expression/WT_vs_set2_0.05_sigGenes.tsv", sep = "\t", header = TRUE, quote = "")  # quote = "" is important. Do not separate a string due to double/single quotes. By default read.table recognizes both double/single quotes.
+comparison2 <- read.table(file = "/Users/jil655/o2/PIs/william_mair/hbc_rnaseq_chipseq_Set2_and_CRTC1_aging_mutants_celegans_hbc03859/Mair_Project_in_R/DGE/results/2020-03-30/differential_expression/set2_vs_set2-crtc1_0.05_sigGenes.tsv", sep = "\t", header = TRUE, quote = "")
+
+# prepare list for comparison1
+comparison1_up <- comparison1 %>% 
+  filter(log2FoldChange > 0)  # genes upregulated in set2, compared to WT
+comparison1_down <- comparison1 %>% 
+  filter(log2FoldChange < 0) # genes downregulated in set2, compared to WT
+comparison1_up_seq_list <- comparison1_up$seq_name  # Since some seq_name corresponds to empty gene_name, use seq_name for merging
+comparison1_down_seq_list <- comparison1_down$seq_name
+
+# prepare list for comparison2
+comparison2_up <- comparison2 %>% 
+  filter(log2FoldChange > 0)  # genes upregulated in set2-crtc1, compared to set2
+comparison2_down <- comparison2 %>% 
+  filter(log2FoldChange < 0) # genes downregulated in set2-crtc1, compared to set2
+comparison2_up_seq_list <- comparison2_up$seq_name
+comparison2_down_seq_list <- comparison2_down$seq_name
+
+# Identify genes upregulated in set2, then reverse back in set2-crtc1
+group1 <- intersect(comparison1_up_seq_list, comparison2_down_seq_list)
+group1 <- as.data.frame(group1) %>% 
+  rename(seq_name = group1)  # convert to dataframe
+group1_result <- left_join(group1, comparison1, by = "seq_name") %>% 
+  select(gene_name, seq_name, gene_id, description, log2FoldChange, padj) %>% 
+  rename(log2FoldChange_WT_vs_set2 = log2FoldChange) %>% 
+  rename(padj_WT_vs_set2 = padj) %>% 
+  left_join(comparison2[,c(1,5,8)], by = "seq_name") %>%  rename(log2FoldChange_set2_vs_set2_crtc1 = log2FoldChange) %>% 
+  rename(padj_set2_vs_set2_crtc1 = padj)
+
+rio::export(group1_result, file = "/Users/jil655/o2/PIs/william_mair/hbc_rnaseq_chipseq_Set2_and_CRTC1_aging_mutants_celegans_hbc03859/Mair_Project_in_R/DGE/results/2020-04-07/group1.tsv")
+
+# Extract gene expression profile for top candidate gene
+d <- plotCounts(dds, gene="C38D9_2", intgroup="condition", returnData=TRUE) # gene name should use "_", not ".", because in dds the gene is still represented as "_"
+ggplot(d, aes(x = condition, y = count, color = condition)) + 
+    geom_point(position=position_jitter(w = 0.1,h = 0)) +
+    theme_bw() +
+    ggtitle("C38D9.2") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+# Identify genes downregulated in set2, then reverse back in set2-crtc1
+group2 <- intersect(comparison1_down_seq_list, comparison2_up_seq_list)
+group2 <- as.data.frame(group2) %>% 
+  rename(seq_name = group2)  # convert to dataframe
+group2_result <- left_join(group2, comparison1, by = "seq_name") %>% 
+  select(gene_name, seq_name, gene_id, description, log2FoldChange, padj) %>% 
+  rename(log2FoldChange_WT_vs_set2 = log2FoldChange) %>% 
+  rename(padj_WT_vs_set2 = padj) %>% 
+  left_join(comparison2[,c(1,5,8)], by = "seq_name") %>%  rename(log2FoldChange_set2_vs_set2_crtc1 = log2FoldChange) %>% 
+  rename(padj_set2_vs_set2_crtc1 = padj)
+
+rio::export(group2_result, file = "/Users/jil655/o2/PIs/william_mair/hbc_rnaseq_chipseq_Set2_and_CRTC1_aging_mutants_celegans_hbc03859/Mair_Project_in_R/DGE/results/2020-04-07/group2.tsv")
+
+# Extract gene expression profile for top candidate gene
+d <- plotCounts(dds, gene="T01C3_7", intgroup="condition", returnData=TRUE) # gene name should use "_", not ".", because in dds the gene is still represented as "_"
+ggplot(d, aes(x = condition, y = count, color = condition)) + 
+    geom_point(position=position_jitter(w = 0.1,h = 0)) +
+    theme_bw() +
+    ggtitle("T01C3.7") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+We identified `r nrow(group1)` genes that belong to group1, and `r nrow(group2)` genes that belong to group2. The expression of individual genes in each sample could be visualized to confirm the expression pattern.
+
+Next, we identified gene list for group3 and group4.
+```{r}
+# Import significant gene list for WT vs set2, and whole gene list for set2 vs set2-crtc1. Name WT vs set2 as comparison1, and set2 vs set2-crtc1 as comparison2.
+comparison1_sig <- read.table(file = "results/Final/differential_expression/contrast2_WT_vs_set2_0.05_sigGenes.tsv", sep = "\t", header = TRUE, quote = "")  # quote = "" is important. Do not separate a string due to double/single quotes. By default read.table recognizes both double/single quotes.
+comparison2_all <- read.table(file = "results/Final/differential_expression/contrast1_set2_vs_set2-crtc1.tsv", sep = "\t", header = TRUE, quote = "")
+comparison2_insig <- comparison2_all %>% 
+  filter(padj > 0.05) # Find gene list that are NOT significant between set2 and set2-crtc1
+
+# prepare list for comparison1
+comparison1_sig_up <- comparison1_sig %>% 
+  filter(log2FoldChange > 0)  # genes upregulated in set2, compared to WT
+comparison1_sig_down <- comparison1_sig %>% 
+  filter(log2FoldChange < 0) # genes downregulated in set2, compared to WT
+comparison1_sig_up_seq_list <- comparison1_sig_up$seq_name  # Since some seq_name corresponds to empty gene_name, use seq_name for merging
+comparison1_sig_down_seq_list <- comparison1_sig_down$seq_name
+
+# prepare list for comparison2. Just need to extract insignificant gene list
+comparison2_insig_seq_list <- comparison2_insig$seq_name
+
+# GROUP3: Identify genes upregulated in set2, then stay at similar level in set2-crtc1
+group3 <- intersect(comparison1_sig_up_seq_list, comparison2_insig_seq_list)
+group3 <- as.data.frame(group3) %>% 
+  rename(seq_name = group3)  # convert to dataframe
+group3_result <- left_join(group3, comparison1_sig, by = "seq_name") %>% 
+  select(gene_name, seq_name, gene_id, description, log2FoldChange, padj) %>% 
+  rename(log2FoldChange_WT_vs_set2 = log2FoldChange) %>% 
+  rename(padj_WT_vs_set2 = padj) %>% 
+  left_join(comparison2_insig[,c(1,5,8)], by = "seq_name") %>%  rename(log2FoldChange_set2_vs_set2_crtc1 = log2FoldChange) %>% 
+  rename(padj_set2_vs_set2_crtc1 = padj)
+
+rio::export(group3_result, file = "results/Final/group3.tsv")
+
+# Extract gene expression profile for top candidate gene in group 3
+d <- plotCounts(dds, gene="W06F12_3", intgroup="condition", returnData=TRUE) # gene name should use "_", not ".", because in dds the gene is still represented as "_"
+ggplot(d, aes(x = condition, y = count, color = condition)) + 
+    geom_point(position=position_jitter(w = 0.1,h = 0)) +
+    theme_bw() +
+    ggtitle("H19N07_3") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+# GROUP4: Identify genes downregulated in set2, then stay at similar level in set2-crtc1
+group4 <- intersect(comparison1_sig_down_seq_list, comparison2_insig_seq_list)
+group4 <- as.data.frame(group4) %>% 
+  rename(seq_name = group4)  # convert to dataframe
+group4_result <- left_join(group4, comparison1_sig, by = "seq_name") %>% 
+  select(gene_name, seq_name, gene_id, description, log2FoldChange, padj) %>% 
+  rename(log2FoldChange_WT_vs_set2 = log2FoldChange) %>% 
+  rename(padj_WT_vs_set2 = padj) %>% 
+  left_join(comparison2_insig[,c(1,5,8)], by = "seq_name") %>%  rename(log2FoldChange_set2_vs_set2_crtc1 = log2FoldChange) %>% 
+  rename(padj_set2_vs_set2_crtc1 = padj)
+
+rio::export(group4_result, file = "results/Final/group4.tsv")
+
+# Extract gene expression profile for top candidate gene in group 4
+d <- plotCounts(dds, gene="F57F5_1", intgroup="condition", returnData=TRUE) # gene name should use "_", not ".", because in dds the gene is still represented as "_"
+ggplot(d, aes(x = condition, y = count, color = condition)) + 
+    geom_point(position=position_jitter(w = 0.1,h = 0)) +
+    theme_bw() +
+    ggtitle("F57F5_1") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+The DEG pattern for group 3 and group 4 genes have some mixed trend, where set2-crtc1 does not stay exactly at similar level as set2. The gene list is then narrowed down, where padj for significance is < 0.01, and padj for insignificance is > 0.6. The more stringent criteria will make DEG pattern more as expected.
+```{r}
+# Import significant gene list for WT vs set2, and whole gene list for set2 vs set2-crtc1. Name WT vs set2 as comparison1, and set2 vs set2-crtc1 as comparison2.
+comparison1_sig <- read.table(file = "results/Final/differential_expression/contrast2_WT_vs_set2_0.05_sigGenes.tsv", sep = "\t", header = TRUE, quote = "")  # quote = "" is important. Do not separate a string due to double/single quotes. By default read.table recognizes both double/single quotes.
+comparison1_sig <- comparison1_sig %>% 
+  filter(padj < 0.01) # Use 0.01 instead of 0.05 as threshold for significance here
+comparison2_all <- read.table(file = "results/Final/differential_expression/contrast1_set2_vs_set2-crtc1.tsv", sep = "\t", header = TRUE, quote = "")
+comparison2_insig <- comparison2_all %>% 
+  filter(padj > 0.6) # Find gene list that are NOT significant between set2 and set2-crtc1. Use 0.2 here instead of 0.05
+
+# prepare list for comparison1
+comparison1_sig_up <- comparison1_sig %>% 
+  filter(log2FoldChange > 0)  # genes upregulated in set2, compared to WT
+comparison1_sig_down <- comparison1_sig %>% 
+  filter(log2FoldChange < 0) # genes downregulated in set2, compared to WT
+comparison1_sig_up_seq_list <- comparison1_sig_up$seq_name  # Since some seq_name corresponds to empty gene_name, use seq_name for merging
+comparison1_sig_down_seq_list <- comparison1_sig_down$seq_name
+
+# prepare list for comparison2. Just need to extract insignificant gene list
+comparison2_insig_seq_list <- comparison2_insig$seq_name
+
+# GROUP3: Identify genes upregulated in set2, then stay at similar level in set2-crtc1
+group3 <- intersect(comparison1_sig_up_seq_list, comparison2_insig_seq_list)
+group3 <- as.data.frame(group3) %>% 
+  rename(seq_name = group3)  # convert to dataframe
+group3_result <- left_join(group3, comparison1_sig, by = "seq_name") %>% 
+  select(gene_name, seq_name, gene_id, description, log2FoldChange, padj) %>% 
+  rename(log2FoldChange_WT_vs_set2 = log2FoldChange) %>% 
+  rename(padj_WT_vs_set2 = padj) %>% 
+  left_join(comparison2_insig[,c(1,5,8)], by = "seq_name") %>%  rename(log2FoldChange_set2_vs_set2_crtc1 = log2FoldChange) %>% 
+  rename(padj_set2_vs_set2_crtc1 = padj)
+
+rio::export(group3_result, file = "results/Final/group3_stringent.tsv")
+
+# Extract gene expression profile for top candidate gene in group 3
+d <- plotCounts(dds, gene="C46G7_4", intgroup="condition", returnData=TRUE) # gene name should use "_", not ".", because in dds the gene is still represented as "_"
+ggplot(d, aes(x = condition, y = count, color = condition)) + 
+    geom_point(position=position_jitter(w = 0.1,h = 0)) +
+    theme_bw() +
+    ggtitle("C46G7_4") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+# GROUP4: Identify genes downregulated in set2, then stay at similar level in set2-crtc1
+group4 <- intersect(comparison1_sig_down_seq_list, comparison2_insig_seq_list)
+group4 <- as.data.frame(group4) %>% 
+  rename(seq_name = group4)  # convert to dataframe
+group4_result <- left_join(group4, comparison1_sig, by = "seq_name") %>% 
+  select(gene_name, seq_name, gene_id, description, log2FoldChange, padj) %>% 
+  rename(log2FoldChange_WT_vs_set2 = log2FoldChange) %>% 
+  rename(padj_WT_vs_set2 = padj) %>% 
+  left_join(comparison2_insig[,c(1,5,8)], by = "seq_name") %>%  rename(log2FoldChange_set2_vs_set2_crtc1 = log2FoldChange) %>% 
+  rename(padj_set2_vs_set2_crtc1 = padj)
+
+rio::export(group4_result, file = "results/Final/group4_stringent.tsv")
+
+# Extract gene expression profile for top candidate gene in group 4
+d <- plotCounts(dds, gene="C16A3_10", intgroup="condition", returnData=TRUE) # gene name should use "_", not ".", because in dds the gene is still represented as "_"
+ggplot(d, aes(x = condition, y = count, color = condition)) + 
+    geom_point(position=position_jitter(w = 0.1,h = 0)) +
+    theme_bw() +
+    ggtitle("C16A3_10") +
+    theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Conclusions
+
+We've performed a differential expression analysis between the samples to identify genes with significant differences between condition (set2-crtc1 vs set2). 3300 genes show differential expression with an adjusted pvalue less or equal than `r params$sig_genes_alpha`.
+
+# R session
+
+```{r}
+devtools::session_info()
+```
